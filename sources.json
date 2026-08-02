@@ -1,0 +1,41 @@
+{
+  "_read_me_first": "This is the only file you need to edit to change what gets collected. Each entry is one official source. 'feed' must be an RSS or Atom address (a machine-readable list of new pages). 'status' is either confirmed (someone checked it works) or unconfirmed (nobody has). Do not mark anything confirmed until you have seen it succeed in a run log.",
+  "max_items_per_source": 5,
+  "sources": [
+    {
+      "id": "uk-hansard-commons",
+      "name": "UK Parliament — House of Commons (Hansard)",
+      "country": "United Kingdom",
+      "feed": "https://hansard.parliament.uk/rss/commons",
+      "status": "unconfirmed"
+    },
+    {
+      "id": "uk-hansard-lords",
+      "name": "UK Parliament — House of Lords (Hansard)",
+      "country": "United Kingdom",
+      "feed": "https://hansard.parliament.uk/rss/lords",
+      "status": "unconfirmed"
+    },
+    {
+      "id": "whitehouse-briefings",
+      "name": "The White House — Briefings and Statements",
+      "country": "United States",
+      "feed": "https://www.whitehouse.gov/briefings-statements/feed/",
+      "status": "unconfirmed"
+    },
+    {
+      "id": "un-press",
+      "name": "United Nations — Meetings Coverage and Press Releases",
+      "country": "International",
+      "feed": "https://press.un.org/en/rss.xml",
+      "status": "unconfirmed"
+    },
+    {
+      "id": "ec-statements",
+      "name": "European Commission — Statements",
+      "country": "European Union",
+      "feed": "https://ec.europa.eu/commission/presscorner/api/rss?language=en&type=STATEMENT",
+      "status": "unconfirmed"
+    }
+  ]
+}

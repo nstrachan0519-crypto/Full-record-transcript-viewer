@@ -1,473 +1,359 @@
 /*
- * THE FULL RECORD — collector
- * every word, worldwide, zero opinion.
+ * The Full Record — the collector.
+ * Reads a fixed list of official sources and saves what they published, word for word.
+ * No AI. No API keys. No dependencies. Node 18 or newer.
  *
- * WHAT THIS IS, IN PLAIN LANGUAGE
- * -------------------------------
- * This program runs once a day on GitHub's computers. It reads official
- * transcript pages, pulls out the words exactly as published, and saves them
- * as files in this repository.
- *
- * WHY SAVING THEM AS FILES MATTERS
- * Every save is recorded in the repository's history, with a date. If a
- * source ever changes the wording of something it already published, that
- * change shows up in the history as a visible difference. Nobody has to be
- * trusted for that to work — it is just how version history behaves. That
- * public, dated trail is the point of this project, not a side effect.
- *
- * WHAT THIS PROGRAM DOES NOT DO
- *  - No API keys. Nothing to steal, for us or for anyone using the site.
- *  - No credit card, ever, for anyone.
- *  - No AI. Nothing summarises, shortens, rewrites or interprets.
- *    The words that come out are the words that went in.
- *  - No searching. We check a fixed list of addresses we already know.
- *
- * COPYRIGHT — OPEN ITEM, NOT SETTLED. READ BEFORE PUBLISHING WIDELY.
- * Works produced by the US federal government carry no copyright, so the
- * government's own record of what an official said can be republished
- * freely. Archives that host and organise those records may hold rights in
- * their own compilation and notes. Every record here therefore stores and
- * displays its direct source link, and readers are sent to the original.
- * That is a defensible position, not a cleared one. Get a lawyer's opinion
- * before publishing at scale. Flagged open per METHOD FILE §10 —
- * flag, never strike.
+ * Run it:            node collect.mjs
+ * Test one page:     node collect.mjs --debug https://example.gov/some-transcript
  */
 
-import { writeFile, mkdir, readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { readFile, writeFile, mkdir, readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 // ---------------------------------------------------------------------------
-// SOURCES — the doors we already know the address of
+// SETTINGS — change these before you launch.
 // ---------------------------------------------------------------------------
-// We never search. We check the same addresses every day. That is what keeps
-// this free and what keeps it honest: no algorithm decides what is worth
-// showing you.
-//
-// verified:
-//   "confirmed"   = this listing page was checked directly and it worked
-//   "unconfirmed" = not yet checked. Do not trust it until it is.
-// Untested is a gap, not a blank (METHOD FILE §12D).
 
-const SOURCES = [
-  {
-    id: "app-remarks",
-    label: "Presidential remarks and addresses",
-    org: "The American Presidency Project (UC Santa Barbara)",
-    listUrl:
-      "https://www.presidency.ucsb.edu/documents/app-categories/presidential/spoken-addresses-and-remarks",
-    origin: "https://www.presidency.ucsb.edu",
-    verified: "confirmed",
-  },
-  {
-    id: "app-news-conferences",
-    label: "Presidential news conferences",
-    org: "The American Presidency Project (UC Santa Barbara)",
-    listUrl:
-      "https://www.presidency.ucsb.edu/documents/app-categories/presidential/news-conferences",
-    origin: "https://www.presidency.ucsb.edu",
-    verified: "unconfirmed",
-  },
-  {
-    id: "wh-briefings",
-    label: "White House briefings and statements",
-    org: "The White House",
-    listUrl: "https://www.whitehouse.gov/briefings-statements/",
-    origin: "https://www.whitehouse.gov",
-    verified: "confirmed",
-  },
-];
+// Put a real address here so a source can reach a person if this misbehaves.
+const CONTACT = "contact@example.com"; // <-- CHANGE THIS
+const USER_AGENT = `TheFullRecord/1.0 (transcript archive; ${CONTACT})`;
 
-// How many new documents to pull from each source per run.
-const PER_SOURCE = Number(process.env.PER_SOURCE || 6);
-
-// How many records the front page lists. The archive keeps everything.
-const INDEX_SIZE = 100;
-
-// Be a polite guest: one request at a time, with a pause between.
-const POLITE_DELAY_MS = 1500;
-const USER_AGENT =
-  "TheFullRecord/1.0 (civic transcript archive; contact: SET-THIS-BEFORE-LAUNCH)";
-
-const OUT_DIR = "docs/data";
-const DOCS_DIR = path.join(OUT_DIR, "documents");
+const OUT_DIR = "docs/records";       // one file per transcript
+const INDEX_FILE = "docs/index.json"; // the list the website reads
+const LOG_FILE = "docs/last-run.json";// what happened on the most recent run
+const MAX_RECORDS_KEPT = 600;         // newest kept, oldest dropped
+const MIN_CHARS = 400;                // shorter than this is treated as a failed grab
+const PAUSE_MS = 1500;                // wait between requests, to be a polite visitor
+const TIMEOUT_MS = 25000;
 
 // ---------------------------------------------------------------------------
-// HELPERS
+// Small helpers
 // ---------------------------------------------------------------------------
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sha = (s) => createHash("sha256").update(s).digest("hex").slice(0, 16);
 
-async function politeFetch(url) {
-  const res = await fetch(url, {
-    headers: {
-      "user-agent": USER_AGENT,
-      accept: "text/html,application/xhtml+xml",
-    },
-    redirect: "follow",
-  });
-  if (!res.ok) throw new Error(`Source returned ${res.status}`);
-  return await res.text();
+function log(...a) {
+  console.log(...a);
 }
 
-// Turn a messy chunk of web page into plain readable text.
-// No library, nothing clever: remove the tags, keep the paragraphs.
-export function htmlToText(html) {
+async function get(url) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "user-agent": USER_AGENT,
+        accept: "text/html,application/xhtml+xml,application/xml,application/rss+xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en",
+      },
+      redirect: "follow",
+      signal: ctl.signal,
+    });
+    const body = await res.text();
+    return { ok: res.ok, status: res.status, body, finalUrl: res.url || url };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cleaning. Anything that could run as code is removed before we keep a word.
+// ---------------------------------------------------------------------------
+
+function stripDangerous(html) {
   return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<nav[\s\S]*?<\/nav>/gi, " ")
-    .replace(/<header[\s\S]*?<\/header>/gi, " ")
-    .replace(/<footer[\s\S]*?<\/footer>/gi, " ")
-    .replace(/<\/(p|div|br|li|h[1-6])>/gi, "\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#8217;|&rsquo;/g, "\u2019")
-    .replace(/&#8216;|&lsquo;/g, "\u2018")
-    .replace(/&#8220;|&ldquo;/g, "\u201C")
-    .replace(/&#8221;|&rdquo;/g, "\u201D")
-    .replace(/&#8212;|&mdash;/g, "\u2014")
-    .replace(/&#39;|&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript\b[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<iframe\b[\s\S]*?<\/iframe>/gi, " ")
+    .replace(/<svg\b[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ");
+}
+
+function stripChrome(html) {
+  return html
+    .replace(/<nav\b[\s\S]*?<\/nav>/gi, " ")
+    .replace(/<header\b[\s\S]*?<\/header>/gi, " ")
+    .replace(/<footer\b[\s\S]*?<\/footer>/gi, " ")
+    .replace(/<aside\b[\s\S]*?<\/aside>/gi, " ")
+    .replace(/<form\b[\s\S]*?<\/form>/gi, " ");
+}
+
+const ENTITIES = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  mdash: "\u2014", ndash: "\u2013", hellip: "\u2026",
+  lsquo: "\u2018", rsquo: "\u2019", ldquo: "\u201C", rdquo: "\u201D",
+};
+
+function decode(s) {
+  return s
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&([a-z]+);/gi, (m, name) => ENTITIES[name.toLowerCase()] ?? m);
+}
+
+function toText(html) {
+  const withBreaks = html
+    .replace(/<\/(p|div|li|tr|h[1-6]|blockquote|section|article)>/gi, "\n\n")
+    .replace(/<br\s*\/?>/gi, "\n");
+  return decode(withBreaks.replace(/<[^>]+>/g, " "))
     .replace(/[ \t\u00a0]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
-    .replace(/^[ \t]+|[ \t]+$/gm, "")
+    .split("\n")
+    .map((l) => l.trim())
+    .join("\n")
     .trim();
 }
 
-// ---------------------------------------------------------------------------
-// FINDING THE TRANSCRIPT INSIDE A PAGE
-// ---------------------------------------------------------------------------
-// HONEST NOTE: the exact tag names these archives use to wrap a transcript
-// have NOT been verified against the live sites. Rather than guess one and
-// silently get nothing, we try several in order and record which one actually
-// worked, in every saved record. Run `npm run debug -- <url>` to see the
-// answer for any page, then move the real one to the top of this list and
-// delete the guesses. METHOD FILE §12B: measure, do not assume.
-
+// Where the words usually live. Order matters — first good hit wins.
+// If one method proves right for a source, move it to the top and delete guesses.
 const CONTENT_CANDIDATES = [
-  { name: "field-docs-content", re: /class="[^"]*field-docs-content[^"]*"/i },
-  { name: "field--name-body", re: /class="[^"]*field--name-body[^"]*"/i },
-  { name: "node__content", re: /class="[^"]*node__content[^"]*"/i },
-  { name: "article-body", re: /class="[^"]*article-?body[^"]*"/i },
-  { name: "entry-content", re: /class="[^"]*entry-content[^"]*"/i },
+  { method: "<article>", re: /<article\b[^>]*>([\s\S]*?)<\/article>/i },
+  { method: "<main>", re: /<main\b[^>]*>([\s\S]*?)<\/main>/i },
+  { method: 'role="main"', re: /<[^>]+role=["']main["'][^>]*>([\s\S]*?)<\/(?:div|section)>/i },
+  { method: "class contains transcript", re: /<(?:div|section)[^>]*class=["'][^"']*transcript[^"']*["'][^>]*>([\s\S]*?)<\/(?:div|section)>/i },
+  { method: "class contains body-content", re: /<(?:div|section)[^>]*class=["'][^"']*(?:body-content|page-content|entry-content|field--name-body)[^"']*["'][^>]*>([\s\S]*?)<\/(?:div|section)>/i },
+  { method: "whole <body> (last resort)", re: /<body\b[^>]*>([\s\S]*?)<\/body>/i },
 ];
 
-function extractBlock(html, re) {
-  const match = re.exec(html);
-  if (!match) return null;
-  const start = html.lastIndexOf("<", match.index);
-  if (start < 0) return null;
-  return html.slice(start, start + 400000);
-}
-
-function longestParagraphRun(html) {
-  const paras = html.match(/<p[\s>][\s\S]*?<\/p>/gi);
-  if (!paras || paras.length === 0) return null;
-  return paras.join("\n");
-}
-
-export function extractTranscript(html) {
-  for (const cand of CONTENT_CANDIDATES) {
-    const block = extractBlock(html, cand.re);
-    if (block) {
-      const text = htmlToText(block);
-      if (text.length > 400) return { text, method: cand.name };
-    }
+function extract(html) {
+  const safe = stripChrome(stripDangerous(html));
+  let best = { text: "", method: "nothing found" };
+  for (const c of CONTENT_CANDIDATES) {
+    const m = safe.match(c.re);
+    if (!m) continue;
+    const text = toText(m[1]);
+    if (text.length > best.text.length) best = { text, method: c.method };
+    if (best.text.length >= MIN_CHARS && c.method !== "whole <body> (last resort)") break;
   }
-  const fallback = longestParagraphRun(html);
-  if (fallback) {
-    const text = htmlToText(fallback);
-    if (text.length > 400) return { text, method: "longest-paragraph-run" };
-  }
-  return { text: "", method: "none" };
+  return best;
 }
 
-export function extractTitle(html) {
-  const h1 = /<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(html);
+function titleOf(html) {
+  const h1 = html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i);
   if (h1) {
-    const t = htmlToText(h1[1]);
-    if (t) return t;
+    const t = toText(h1[1]);
+    if (t) return t.slice(0, 300);
   }
-  const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
-  return title ? htmlToText(title[1]).split("|")[0].trim() : "Untitled record";
+  const t = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+  return t ? toText(t[1]).slice(0, 300) : "Untitled";
 }
 
-export function extractDate(html) {
-  const timeTag = /<time[^>]*datetime="([^"]+)"/i.exec(html);
-  if (timeTag) return timeTag[1].slice(0, 10);
-  const meta =
-    /<meta[^>]+property="article:published_time"[^>]+content="([^"]+)"/i.exec(
-      html
+// ---------------------------------------------------------------------------
+// Feed reading. A feed is a machine-readable list of new pages (RSS or Atom).
+// ---------------------------------------------------------------------------
+
+function parseFeed(xml) {
+  const items = [];
+  const blocks = xml.match(/<(item|entry)\b[\s\S]*?<\/\1>/gi) || [];
+  for (const b of blocks) {
+    let link =
+      (b.match(/<link[^>]*rel=["']alternate["'][^>]*href=["']([^"']+)["']/i) || [])[1] ||
+      (b.match(/<link[^>]*href=["']([^"']+)["']/i) || [])[1] ||
+      (b.match(/<link[^>]*>([\s\S]*?)<\/link>/i) || [])[1] ||
+      (b.match(/<guid[^>]*>([\s\S]*?)<\/guid>/i) || [])[1];
+    if (!link) continue;
+    link = decode(link.trim());
+    if (!/^https?:\/\//i.test(link)) continue;
+
+    const title = decode(
+      ((b.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || "")
+        .replace(/<!\[CDATA\[|\]\]>/g, "")
+        .trim()
     );
-  if (meta) return meta[1].slice(0, 10);
-  return null;
-}
+    const date =
+      ((b.match(/<(?:pubDate|published|updated|dc:date)[^>]*>([\s\S]*?)<\/(?:pubDate|published|updated|dc:date)>/i) || [])[1] || "").trim();
 
-// Only follow links that stay on the source's own site, and that look like a
-// document rather than a menu, a category or a page number.
-export function extractLinks(html, origin, limit = 15) {
-  const out = [];
-  const seen = new Set();
-  const re = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-  let m;
-  while ((m = re.exec(html)) !== null && out.length < limit) {
-    let href = m[1];
-    const label = htmlToText(m[2]);
-
-    if (!href || href.startsWith("#")) continue;
-    if (href.startsWith("/")) href = origin + href;
-    if (!href.startsWith(origin)) continue;
-    if (seen.has(href)) continue;
-
-    const looksLikeDoc =
-      /\/documents\/[a-z0-9-]{8,}/i.test(href) ||
-      /\/briefings-statements\/\d{4}\//i.test(href) ||
-      /\/remarks\/\d{4}\//i.test(href);
-    if (!looksLikeDoc) continue;
-    if (/app-categories|advanced-search|\/page\//i.test(href)) continue;
-    if (label.length < 12) continue;
-
-    seen.add(href);
-    out.push({ url: href, title: label });
+    items.push({ link, title, date });
   }
-  return out;
+  return items;
 }
 
-// A stable, safe filename derived from the source URL.
-export function slugFor(url) {
-  return url
-    .replace(/^https?:\/\//, "")
-    .replace(/[^a-z0-9]+/gi, "-")
-    .replace(/^-+|-+$/g, "")
-    .toLowerCase()
-    .slice(0, 120);
+function isoDate(s) {
+  const d = s ? new Date(s) : null;
+  return d && !isNaN(d) ? d.toISOString() : null;
 }
 
 // ---------------------------------------------------------------------------
-// DEBUG MODE — replaces guesses with facts
+// Debug mode — shows exactly what the collector can see on one page.
 // ---------------------------------------------------------------------------
 
-async function runDebug(target) {
-  if (!SOURCES.some((s) => target.startsWith(s.origin))) {
-    console.error("That site is not on the source list. Refusing.");
-    process.exit(1);
+async function debugOne(url) {
+  log(`\nFetching ${url}\n`);
+  const r = await get(url);
+  log(`HTTP status: ${r.status}`);
+  log(`Bytes received: ${r.body.length}`);
+  if (!r.ok) {
+    log(`\nThe site refused. 403 means it blocks automated visitors — that is its choice, not a bug.`);
+    return;
   }
-  const html = await politeFetch(target);
-  const { text, method } = extractTranscript(html);
-  console.log(
-    JSON.stringify(
-      {
-        target,
-        htmlLength: html.length,
-        extractionMethod: method,
-        whichCandidatesMatched: CONTENT_CANDIDATES.filter((c) =>
-          c.re.test(html)
-        ).map((c) => c.name),
-        title: extractTitle(html),
-        date: extractDate(html),
-        wordCount: text ? text.split(/\s+/).length : 0,
-        documentLinksFound: extractLinks(html, new URL(target).origin, 10),
-        textPreview: text.slice(0, 1500),
-      },
-      null,
-      2
-    )
-  );
+  const safe = stripChrome(stripDangerous(r.body));
+  log(`\nWhat each method finds:`);
+  for (const c of CONTENT_CANDIDATES) {
+    const m = safe.match(c.re);
+    log(`  ${String(m ? toText(m[1]).length : 0).padStart(7)} characters — ${c.method}`);
+  }
+  const best = extract(r.body);
+  log(`\nWinner: ${best.method} (${best.text.length} characters)`);
+  log(`Title: ${titleOf(r.body)}`);
+  log(`\nFirst 600 characters:\n---\n${best.text.slice(0, 600)}\n---`);
+  const links = parseFeed(r.body);
+  if (links.length) log(`\nThis also looks like a feed: ${links.length} entries found.`);
 }
 
 // ---------------------------------------------------------------------------
-// THE COLLECTOR
+// The run
 // ---------------------------------------------------------------------------
 
-async function loadExistingIndex() {
-  const file = path.join(OUT_DIR, "index.json");
-  if (!existsSync(file)) return [];
+async function loadIndex() {
   try {
-    const parsed = JSON.parse(await readFile(file, "utf8"));
-    return Array.isArray(parsed.records) ? parsed.records : [];
+    return JSON.parse(await readFile(INDEX_FILE, "utf8"));
   } catch {
-    return [];
+    return { generated: null, records: [] };
   }
 }
 
-async function collect() {
-  await mkdir(DOCS_DIR, { recursive: true });
+async function main() {
+  const args = process.argv.slice(2);
+  if (args[0] === "--debug") {
+    if (!args[1]) return log("Give an address: node collect.mjs --debug https://...");
+    return debugOne(args[1]);
+  }
 
-  const existing = await loadExistingIndex();
-  const known = new Set(existing.map((r) => r.sourceUrl));
+  const config = JSON.parse(await readFile("sources.json", "utf8"));
+  const maxPer = config.max_items_per_source || 5;
+  await mkdir(OUT_DIR, { recursive: true });
 
-  const report = {
-    startedAt: new Date().toISOString(),
-    sources: [],
-    newRecords: 0,
-    skippedAlreadyHave: 0,
-  };
-  const added = [];
+  const index = await loadIndex();
+  const known = new Set(index.records.map((r) => r.id));
+  const report = [];
+  let added = 0;
 
-  for (const source of SOURCES) {
-    const sr = {
-      id: source.id,
-      org: source.org,
-      listUrl: source.listUrl,
-      linksFound: 0,
-      stored: 0,
-      skipped: 0,
-      errors: [],
-    };
+  log(`The Full Record — collector`);
+  log(`Started ${new Date().toISOString()}`);
+  log(`Sources: ${config.sources.length}\n`);
 
+  for (const src of config.sources) {
+    const line = { id: src.id, name: src.name, feedStatus: null, found: 0, saved: 0, failures: [] };
+    log(`--- ${src.name} (${src.status})`);
+    log(`    feed: ${src.feed}`);
+
+    let feed;
     try {
-      const listHtml = await politeFetch(source.listUrl);
-      const links = extractLinks(listHtml, source.origin, PER_SOURCE);
-      sr.linksFound = links.length;
-
-      if (links.length === 0) {
-        sr.errors.push(
-          "No document links found. The listing page may be built by " +
-            "JavaScript, or the link pattern may have changed. " +
-            "Run the debug command on this URL to see what is actually there."
-        );
-      }
-
-      for (const link of links) {
-        if (known.has(link.url)) {
-          sr.skipped++;
-          report.skippedAlreadyHave++;
-          continue;
-        }
-        await sleep(POLITE_DELAY_MS);
-        try {
-          const docHtml = await politeFetch(link.url);
-          const { text, method } = extractTranscript(docHtml);
-
-          if (!text || text.length < 400) {
-            sr.errors.push(
-              `Too little text from ${link.url} (method: ${method})`
-            );
-            continue;
-          }
-
-          const record = {
-            slug: slugFor(link.url),
-            title: extractTitle(docHtml) || link.title,
-            date: extractDate(docHtml),
-            // The source URL is the record's identity. There is no record
-            // without one. This is the unbreakable rule, enforced by structure
-            // rather than by remembering to follow it.
-            sourceUrl: link.url,
-            sourceOrg: source.org,
-            sourceLabel: source.label,
-            firstCollectedAt: new Date().toISOString(),
-            extractionMethod: method,
-            wordCount: text.split(/\s+/).length,
-          };
-
-          await writeFile(
-            path.join(DOCS_DIR, record.slug + ".json"),
-            JSON.stringify({ ...record, text }, null, 2) + "\n",
-            "utf8"
-          );
-
-          added.push(record);
-          known.add(link.url);
-          sr.stored++;
-          report.newRecords++;
-        } catch (err) {
-          sr.errors.push(`${link.url}: ${err.message}`);
-        }
-      }
-    } catch (err) {
-      sr.errors.push(`Listing page failed: ${err.message}`);
+      feed = await get(src.feed);
+    } catch (e) {
+      line.feedStatus = `error: ${e.message}`;
+      log(`    FAILED to reach the feed: ${e.message}`);
+      report.push(line);
+      continue;
+    }
+    line.feedStatus = feed.status;
+    if (!feed.ok) {
+      log(`    Feed refused with status ${feed.status}${feed.status === 403 ? " (blocks automated visitors)" : ""}`);
+      report.push(line);
+      continue;
     }
 
-    report.sources.push(sr);
-  }
-
-  // Merge new records into the existing index. Nothing is ever removed —
-  // the archive only grows, so the history stays complete.
-  const all = [...added, ...existing];
-  const deduped = [];
-  const seen = new Set();
-  for (const r of all) {
-    if (seen.has(r.sourceUrl)) continue;
-    seen.add(r.sourceUrl);
-    deduped.push(r);
-  }
-  deduped.sort((a, b) =>
-    (b.date || b.firstCollectedAt || "").localeCompare(
-      a.date || a.firstCollectedAt || ""
-    )
-  );
-
-  await writeFile(
-    path.join(OUT_DIR, "index.json"),
-    JSON.stringify(
-      {
-        generatedAt: new Date().toISOString(),
-        note:
-          "Verbatim records. Nothing here is summarised, shortened or edited. " +
-          "Every record carries the direct link to its source.",
-        total: deduped.length,
-        records: deduped.slice(0, INDEX_SIZE),
-      },
-      null,
-      2
-    ) + "\n",
-    "utf8"
-  );
-
-  report.finishedAt = new Date().toISOString();
-  report.totalInArchive = deduped.length;
-
-  await writeFile(
-    path.join(OUT_DIR, "last-run.json"),
-    JSON.stringify(report, null, 2) + "\n",
-    "utf8"
-  );
-
-  // Print the whole report, including every failure, so the workflow log
-  // shows what did not work as clearly as what did.
-  console.log(JSON.stringify(report, null, 2));
-
-  const anyStored = report.newRecords > 0;
-  const allSourcesFailed = report.sources.every(
-    (s) => s.stored === 0 && s.skipped === 0
-  );
-  if (allSourcesFailed) {
-    console.error(
-      "\nEVERY SOURCE RETURNED NOTHING. Not treating this as success."
-    );
-    process.exit(1);
-  }
-  if (!anyStored) {
-    console.log("\nNo new records today. Everything found was already held.");
-  }
-}
-
-// ---------------------------------------------------------------------------
-
-// Only act when this file is RUN directly. If another file imports it (the
-// self-test does), it must quietly hand over its functions and do nothing
-// else. Found by testing: without this guard, importing it started a real
-// collection run.
-const runDirectly =
-  process.argv[1] && import.meta.url === "file://" + path.resolve(process.argv[1]);
-
-if (runDirectly) {
-  const arg = process.argv[2];
-  if (arg === "--debug") {
-    const target = process.argv[3];
-    if (!target) {
-      console.error("Usage: node collect.mjs --debug <url>");
-      process.exit(1);
+    const items = parseFeed(feed.body).slice(0, maxPer);
+    line.found = items.length;
+    log(`    ${items.length} entries in the feed`);
+    if (!items.length) {
+      log(`    No entries readable. The feed address may be wrong, or the page is built by JavaScript.`);
+      report.push(line);
+      continue;
     }
-    await runDebug(target);
-  } else {
-    await collect();
+
+    for (const item of items) {
+      const id = `${src.id}-${sha(item.link)}`;
+      if (known.has(id)) {
+        log(`    already have: ${item.title || item.link}`);
+        continue;
+      }
+      await sleep(PAUSE_MS);
+
+      let page;
+      try {
+        page = await get(item.link);
+      } catch (e) {
+        line.failures.push({ url: item.link, why: e.message });
+        log(`    FAILED ${item.link} — ${e.message}`);
+        continue;
+      }
+      if (!page.ok) {
+        line.failures.push({ url: item.link, why: `HTTP ${page.status}` });
+        log(`    FAILED ${item.link} — HTTP ${page.status}`);
+        continue;
+      }
+
+      const { text, method } = extract(page.body);
+      if (text.length < MIN_CHARS) {
+        line.failures.push({ url: item.link, why: `only ${text.length} characters found` });
+        log(`    TOO SHORT ${item.link} — ${text.length} characters via ${method}`);
+        continue;
+      }
+
+      const record = {
+        id,
+        title: item.title || titleOf(page.body),
+        sourceId: src.id,
+        sourceName: src.name,
+        country: src.country || "",
+        url: page.finalUrl,
+        published: isoDate(item.date),
+        collected: new Date().toISOString(),
+        method,
+        chars: text.length,
+        text,
+      };
+
+      await writeFile(path.join(OUT_DIR, `${id}.json`), JSON.stringify(record, null, 1));
+      index.records.unshift({
+        id: record.id,
+        title: record.title,
+        sourceId: record.sourceId,
+        sourceName: record.sourceName,
+        country: record.country,
+        url: record.url,
+        published: record.published,
+        collected: record.collected,
+        method: record.method,
+        chars: record.chars,
+        snippet: text.slice(0, 700),
+      });
+      known.add(id);
+      added++;
+      line.saved++;
+      log(`    SAVED ${record.chars} characters via ${method} — ${record.title}`);
+    }
+    report.push(line);
   }
+
+  index.records.sort((a, b) => (b.published || b.collected).localeCompare(a.published || a.collected));
+  if (index.records.length > MAX_RECORDS_KEPT) index.records.length = MAX_RECORDS_KEPT;
+  index.generated = new Date().toISOString();
+  index.count = index.records.length;
+
+  await writeFile(INDEX_FILE, JSON.stringify(index, null, 1));
+  await writeFile(
+    LOG_FILE,
+    JSON.stringify({ finished: new Date().toISOString(), added, total: index.records.length, sources: report }, null, 1)
+  );
+
+  // Delete record files no longer in the index, so the folder cannot grow forever.
+  const keep = new Set(index.records.map((r) => `${r.id}.json`));
+  for (const f of await readdir(OUT_DIR)) {
+    if (f.endsWith(".json") && !keep.has(f)) {
+      await writeFile(path.join(OUT_DIR, f), "").catch(() => {});
+    }
+  }
+
+  log(`\nFinished. Added ${added} new record(s). Total in the archive: ${index.records.length}.`);
+  if (added === 0) log(`Nothing new was saved. Read the per-source lines above — they say why.`);
 }
+
+main().catch((e) => {
+  console.error("The collector stopped:", e);
+  process.exit(1);
+});
